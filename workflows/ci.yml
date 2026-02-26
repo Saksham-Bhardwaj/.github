@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use"
+        default: "20"
+        required: false
+        type: string
+      has-backend:
+        description: "Whether the repo has a backend/ directory to check"
+        default: true
+        required: false
+        type: boolean
+      has-extension:
+        description: "Whether the repo has an extension/ directory to check"
+        default: true
+        required: false
+        type: boolean
+
+jobs:
+  extension:
+    name: Extension — Lint, Typecheck, Test, Build
+    if: ${{ inputs.has-extension }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+      - name: Lint
+        id: lint
+        run: npm run lint 2>&1 | tee ../extension-lint.log
+        continue-on-error: true
+      - name: Typecheck
+        id: typecheck
+        run: npm run typecheck 2>&1 | tee ../extension-typecheck.log
+        continue-on-error: true
+      - name: Test
+        id: test
+        run: npm run test 2>&1 | tee ../extension-test.log
+        continue-on-error: true
+      - name: Build
+        id: build
+        run: npm run build 2>&1 | tee ../extension-build.log
+        continue-on-error: true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extension-logs
+          path: |
+            extension-lint.log
+            extension-typecheck.log
+            extension-test.log
+            extension-build.log
+      - name: Set outcome
+        if: always()
+        run: |
+          if [[ "${{ steps.lint.outcome }}" == "failure" || \
+                "${{ steps.typecheck.outcome }}" == "failure" || \
+                "${{ steps.test.outcome }}" == "failure" || \
+                "${{ steps.build.outcome }}" == "failure" ]]; then
+            exit 1
+          fi
+
+  backend:
+    name: Backend — Typecheck, Test, Build
+    if: ${{ inputs.has-backend }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Typecheck
+        id: typecheck
+        run: npm run typecheck 2>&1 | tee ../backend-typecheck.log
+        continue-on-error: true
+      - name: Test
+        id: test
+        run: npm run test 2>&1 | tee ../backend-test.log
+        continue-on-error: true
+      - name: Build
+        id: build
+        run: npm run build 2>&1 | tee ../backend-build.log
+        continue-on-error: true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-logs
+          path: |
+            backend-typecheck.log
+            backend-test.log
+            backend-build.log
+      - name: Set outcome
+        if: always()
+        run: |
+          if [[ "${{ steps.typecheck.outcome }}" == "failure" || \
+                "${{ steps.test.outcome }}" == "failure" || \
+                "${{ steps.build.outcome }}" == "failure" ]]; then
+            exit 1
+          fi
+
+  review-comment:
+    name: Post Review Comment on Failure
+    runs-on: ubuntu-latest
+    needs: [extension, backend]
+    if: always() && (needs.extension.result == 'failure' || needs.backend.result == 'failure') && github.event_name == 'pull_request'
+    permissions:
+      pull-requests: write
+      actions: read
+    steps:
+      - name: Download extension logs
+        uses: actions/download-artifact@v4
+        with:
+          name: extension-logs
+          path: logs
+        continue-on-error: true
+      - name: Download backend logs
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-logs
+          path: logs
+        continue-on-error: true
+      - name: Build review comment
+        id: comment
+        run: |
+          {
+            echo "body<<COMMENT_EOF"
+            echo "## CI Failed on this PR"
+            echo ""
+            echo "The following checks failed. Please fix before merging."
+            echo ""
+
+            for log_file in logs/*.log; do
+              [ -f "$log_file" ] || continue
+              name=$(basename "$log_file" .log)
+              if grep -qiE '(error|fail|FAIL|ERR!)' "$log_file" 2>/dev/null; then
+                echo "### \`$name\`"
+                echo ""
+                echo "<details>"
+                echo "<summary>Click to expand error log</summary>"
+                echo ""
+                echo "\`\`\`"
+                tail -80 "$log_file"
+                echo "\`\`\`"
+                echo ""
+                echo "</details>"
+                echo ""
+              fi
+            done
+
+            echo "---"
+            echo "*Auto-generated by CI. Fix the errors and push again.*"
+            echo "COMMENT_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ steps.comment.outputs.body }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: body
+            });
